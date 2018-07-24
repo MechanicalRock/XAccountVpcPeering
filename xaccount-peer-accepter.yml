@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+    RequesterAccountId:
+        Type: String
+        Description: account ID of the vpc peer requester
+Resources:
+  PeerAccepterRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+            AWS: !Sub "${RequesterAccountId}"
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - cloudformation:ListExports
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+        PolicyName: listCfnExports
+    Type: AWS::IAM::Role
+Outputs:
+  PeerAccepterRoleArn:
+    Value: !GetAtt PeerAccepterRole.Arn
+    Description: The arn of the created peer accepter role
+    Export:
+      Name: !Sub "${AWS::StackName}PeerAccepterRoleArn"

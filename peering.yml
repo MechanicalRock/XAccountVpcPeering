@@ -1,0 +1,259 @@
+Parameters:
+  PeeringOwnerId:
+    Type: String
+    Description: The other AWS account ID that we will peer with
+  FromVpc: 
+    Description: Cfn export name from the requester account that will provide us the VPC ID to peer from
+    Type: String
+  FromVpcRoute1:
+    Description: Cfn export name from the requester account that will provide us first RouteTableId (e.g. AZ-a)
+    Type: String
+  FromVpcRoute2:
+    Description: Cfn export name from the requester account that will provide us second RouteTableId (e.g. AZ-b)
+    Type: String
+  FromVpcCidr:
+    Description: Cfn export name for the requester account VPC CIDR details
+    Type: String
+  ToVpcCidr:
+    Description: Cfn export name from the peer account VPC CIDR details
+    Type: String
+  ToVpc: 
+    Description: Cfn export name from the peer account that will provide us the peer VPC ID
+    Type: String
+#  PeeringRequesterRoleName:
+ #   Description: VPC Peering Requester's role name, to grant assume role permissions to
+  #  Type: String
+  PeerAccepterRoleArn:
+    Type: String
+    Description: The role ARN of the previously created role in the peer accepter's account
+  CfnResponseCode:
+    Type: String
+    Default: >
+        let send = function(event, context, responseStatus, responseData, physicalResourceId, noEcho) {
+          var responseBody = {} 
+          responseBody.Status = responseStatus
+          responseBody.Reason = "See the details in CloudWatch Log Stream:" + context.logStreamName
+          responseBody.PhysicalResourceId =  physicalResourceId || context.logStreamName
+          responseBody.StackId = event.StackId
+          responseBody.RequestId = event.RequestId
+          responseBody.LogicalResourceId = event.LogicalResourceId
+          responseBody.NoEcho =  noEcho || false
+          responseBody.Data =  responseData
+
+          // #TODO - remove
+          responseBody = JSON.stringify(responseBody)
+          console.log("Response body:\n", responseBody);
+
+          var https = require("https");
+          var url = require("url");
+
+          var parsedUrl = ''
+          try {
+            parsedUrl = url.parse(event.ResponseURL);
+          } catch (e) {
+            return
+          }
+          var options = {}
+          options.hostname = parsedUrl.hostname
+          options.port = 443
+          options.path = parsedUrl.path
+          options.method = "PUT"
+          options.headers = {}
+          options.headers["content-type"] = ""
+          options.headers["content-length"] = responseBody.length
+              
+          var request = https.request(options, function(response) {
+              console.log("Status code = " + response.statusCode);
+              console.log("Status message = " + response.statusMessage);
+              context.done();
+          });
+
+          request.on("error", function(error) {
+              console.log("send(..) failed executing https.request(..) - " + error);
+              context.done();
+          });
+
+          request.write(responseBody);
+          request.end();
+        };    
+Resources:
+  PeeringRequesterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Ref PeerAccepterRoleArn                
+        Version: '2012-10-17'
+  PeeringPolicyForRequesterRole:
+    Type: "AWS::IAM::Policy"
+    Properties:       
+      PolicyDocument: 
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Resource: 
+              - !Ref PeerAccepterRoleArn
+      PolicyName: !Sub "PeeringRequesterPolicy-${AWS::AccountId}"
+      Roles:
+        - !Ref PeeringRequesterRole
+  VPCPeeringConnection:
+    DependsOn: PeeringPolicyForRequesterRole
+    Type: "AWS::EC2::VPCPeeringConnection"
+    Properties: 
+      VpcId:
+        Fn::ImportValue: !Sub "${FromVpc}"
+      PeerVpcId: 
+        !GetAtt GetXAccountVpcId.Value
+      PeerOwnerId: 
+        !Ref PeeringOwnerId
+      PeerRoleArn:
+        !Ref PeerAccepterRoleArn
+  VpcPeeringRoute1:
+    Type: "AWS::EC2::Route"
+    Properties: 
+      DestinationCidrBlock:  
+        !GetAtt GetXAccountVpcCidr.Value
+      RouteTableId: 
+        Fn::ImportValue: !Ref FromVpcRoute1
+      VpcPeeringConnectionId: 
+        !Ref VPCPeeringConnection
+  VpcPeeringRoute2:
+    Type: "AWS::EC2::Route"
+    Properties: 
+      DestinationCidrBlock:  
+        !GetAtt GetXAccountVpcCidr.Value
+      RouteTableId: 
+        Fn::ImportValue: !Ref FromVpcRoute2
+      VpcPeeringConnectionId: 
+        !Ref VPCPeeringConnection  
+  
+  GetXAccountVpcId:
+    Properties:
+      Name: 
+        Ref: ToVpc
+      RoleArn: 
+        Ref: PeerAccepterRoleArn
+      ServiceToken:
+        !GetAtt XAccountExportLambda.Arn        
+    Type: Custom::GetXAccountVpcId
+  
+  GetXAccountVpcCidr:
+    Properties:
+      Name: 
+        Ref: ToVpcCidr
+      RoleArn:
+        Ref: PeerAccepterRoleArn
+      ServiceToken:
+        !GetAtt XAccountExportLambda.Arn        
+    Type: Custom::GetXAccountVpcCidr
+  
+  XAccountExportLambda:
+    DependsOn:
+    - LogGroupXAccountExport      
+    Properties:
+      Role: !GetAtt XAccountExportLambdaRole.Arn
+      Code:
+        ZipFile: !Sub > 
+          ${CfnResponseCode}         
+          let AWS = require ('aws-sdk');  
+          exports.handler =  function(event, context, callback) {
+            let exportName = event.ResourceProperties.Name
+            if ( event.RequestType === 'DELETE' ) {
+              send(event,context,"SUCCESS","{}")
+              callback(null,"Successfully deleted custom resource")
+              return
+            }
+            if ( exportName === undefined || exportName.length == 0 ) {
+                console.log(event)
+                send(event,context,"FAILED","{}")
+                callback(new Error("Export 'Name' parameter is required"))
+                return
+            }
+
+            let params = {}
+            params.RoleArn = event.ResourceProperties.RoleArn
+            params.RoleSessionName =  'listExports' 
+            let tokenRequest = new AWS.STS().assumeRole(params).promise()
+            tokenRequest.then( (credResponse) => {
+              let cfnOpts = {}
+              cfnOpts.credentials = {}
+              cfnOpts.credentials.accessKeyId = credResponse.Credentials.AccessKeyId
+              cfnOpts.credentials.secretAccessKey = credResponse.Credentials.SecretAccessKey
+              cfnOpts.credentials.sessionToken = credResponse.Credentials.SessionToken
+              let cfn =  new AWS.CloudFormation(cfnOpts)
+              let exportsPromise = cfn.listExports().promise()
+              exportsPromise
+                .then( (response) => {
+                  let exports = response.Exports.filter( (it) => it.Name == exportName)
+                  if ( exports.length == 1 ) {
+                    let res = exports.pop()
+                    console.log(res)
+                    send(event,context,"SUCCESS",res)
+                    callback(null,res)
+                  } else {
+                    send(event,context,"FAILED","{}")
+                    callback(new Error("Could not find export - "+exportName))    
+                  }
+                })
+                .catch( (err) => {                  
+                  send(event,context,"FAILED","{}")
+                  callback(new Error(err))
+              })
+            }).catch( (err) => {
+                send(event,context,"FAILED","{}")
+                callback(new Error(err) )
+            })
+          }
+      FunctionName: !Sub "${AWS::StackName}-XAccountExport"
+      Handler: index.handler
+      MemorySize: 128
+      Runtime: nodejs6.10
+      Timeout: 300
+    Type: AWS::Lambda::Function
+  XAccountExportLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com            
+        Version: '2012-10-17'        
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - cloudformation:ListExports
+            Effect: Allow
+            Resource: '*'
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Resource: 
+              - !Ref PeerAccepterRoleArn
+          Version: '2012-10-17'
+        PolicyName: listCfnExports
+    Type: AWS::IAM::Role
+
+  LogGroupXAccountExport:
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-XAccountExport"              
+      RetentionInDays: 14
+    Type: AWS::Logs::LogGroup
+  
+Outputs:
+  VpcPeeringConnectionId:
+    Value: !Ref VPCPeeringConnection
+    Export:
+      Name: !Sub "${AWS::StackName}VPCPeeringConnection"
+    Description: The vpc peering connection identifier
